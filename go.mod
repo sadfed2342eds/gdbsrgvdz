@@ -1,3 +1,3 @@
 module github.com/sadfed2342eds/gdbsrgvdz
 
-go 1.22
+go 1.20
