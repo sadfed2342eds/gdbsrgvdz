@@ -1,41 +1,44 @@
-# EVM address activity checker
+# GoChain address activity checker
 
-Многопоточный батчевый чеккер EVM-адресов на Go. Берёт список адресов,
-проверяет каждый через Etherscan V2 unified API (нативные tx + ERC-20 + ERC-721)
-и пишет активные в `result.txt`.
+Многопоточный батчевый чеккер адресов под **GoChain** (chain id 60) на Go.
+Читает список адресов из файла, бьёт напрямую в публичную JSON-RPC ноду
+`https://rpc.gochain.io` и пишет активные адреса в `result.txt`.
+
+## Что считается активностью
+
+Поскольку это обычная JSON-RPC нода (без индексации истории токен-трансферов),
+адрес считается активным, если выполнено хотя бы одно:
+
+- `eth_getTransactionCount(addr, "latest") > 0` — адрес **отправлял** хотя бы
+  одну транзакцию (нативка, ERC-20, NFT, вызов контракта — что угодно),
+- `eth_getBalance(addr, "latest") > 0` — на адрес **приходила** нативка.
+
+Этого достаточно, чтобы отсечь «пустышки» среди своих кошельков.
 
 ## Особенности
 
-- Пул воркеров с настраиваемым параллелизмом (`--workers`).
-- Глобальный rate limiter (`--rps`), чтобы не ловить 429.
+- Пул воркеров (`--workers`).
+- Глобальный rate limiter — token bucket (`--rps`).
 - Ретраи с exponential backoff + jitter (`--retries`).
-- Short-circuit: как только найдена любая активность — адрес записан, следующие
-  запросы по нему не делаются.
-- Дедупликация входа и валидация адресов.
-- Безопасная конкурентная запись в `result.txt` (flush на каждую запись).
+- Short-circuit: как только первый признак активности найден, второй вызов
+  не делается.
+- Только stdlib, без внешних зависимостей.
+- Дедуп и валидация адресов на входе.
+- Конкурентная запись в `result.txt` с flush на каждую строку.
 - Graceful shutdown по Ctrl+C.
 
 ## Использование
 
 ```bash
-export ETHERSCAN_API_KEY=...   # ключ Etherscan V2 (один на все EVM-сети)
-
 # addresses.txt — по одному адресу на строку
 go run . \
   --in addresses.txt \
   --out result.txt \
-  --chain 1 \
-  --workers 10 \
-  --rps 5 \
+  --rpc https://rpc.gochain.io \
+  --workers 20 \
+  --rps 20 \
   --retries 5
 ```
-
-Чейны (chain id): 1 = Ethereum, 56 = BSC, 137 = Polygon, 42161 = Arbitrum,
-10 = Optimism, 8453 = Base, 43114 = Avalanche и т.д. Полный список —
-в [документации Etherscan V2](https://docs.etherscan.io/etherscan-v2/).
-
-На free-плане Etherscan лимит = 5 req/s, поэтому по умолчанию `--rps=5`.
-На платных — можно повышать и увеличивать `--workers`.
 
 ## Сборка
 
@@ -43,3 +46,6 @@ go run . \
 go build -o checker .
 ./checker --in addresses.txt
 ```
+
+Если публичная нода начнёт резать по лимитам — снижай `--rps` / `--workers`
+или подставь свой приватный RPC через `--rpc`.

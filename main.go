@@ -1,19 +1,30 @@
-// Multithreaded batch EVM address activity checker.
+// Multithreaded batch address activity checker for GoChain.
 //
 // Reads addresses (one per line) from --in, checks each one for ANY on-chain
-// activity (native tx / ERC-20 transfer / ERC-721 transfer) via Etherscan V2
-// unified API and appends active addresses to --out (default: result.txt).
+// activity via a public GoChain JSON-RPC node and appends active addresses
+// to --out (default: result.txt).
+//
+// "Activity" for a public JSON-RPC node (no indexer) is defined as:
+//   - eth_getTransactionCount(addr, "latest") > 0  -> the address has sent
+//     at least one tx (native transfer, token transfer, contract call, ...),
+//     OR
+//   - eth_getBalance(addr, "latest") > 0           -> the address has received
+//     native funds at least once.
+//
+// If either holds, the address is considered active and written to result.txt.
+// Short-circuit: we stop checking an address as soon as activity is found.
 //
 // Features:
 //   - Worker pool with configurable concurrency.
-//   - Global rate limiter (token bucket) to respect API quota.
+//   - Global rate limiter (token bucket) to respect node quota.
 //   - Retries with exponential backoff + jitter on transient errors.
-//   - Short-circuit: stops checking an address as soon as activity is found.
 //   - Streaming writer with mutex, so result.txt is always consistent.
+//   - Graceful shutdown on Ctrl+C.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,9 +32,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -38,9 +49,7 @@ import (
 // ----------------------------------------------------------------------------
 
 type Config struct {
-	APIKey     string
-	ChainID    int
-	BaseURL    string
+	RPCURL     string
 	InputFile  string
 	OutputFile string
 	Workers    int
@@ -51,29 +60,22 @@ type Config struct {
 
 func parseFlags() *Config {
 	cfg := &Config{}
-	flag.StringVar(&cfg.APIKey, "key", os.Getenv("ETHERSCAN_API_KEY"),
-		"Etherscan V2 API key (or env ETHERSCAN_API_KEY)")
-	flag.IntVar(&cfg.ChainID, "chain", 1,
-		"EVM chain id (1=ETH, 56=BSC, 137=Polygon, 42161=Arbitrum, 10=Optimism, 8453=Base, ...)")
-	flag.StringVar(&cfg.BaseURL, "url", "https://api.etherscan.io/v2/api",
-		"Etherscan V2 unified API endpoint")
+	flag.StringVar(&cfg.RPCURL, "rpc", "https://rpc.gochain.io",
+		"GoChain JSON-RPC endpoint")
 	flag.StringVar(&cfg.InputFile, "in", "addresses.txt",
 		"input file: one address per line")
 	flag.StringVar(&cfg.OutputFile, "out", "result.txt",
 		"output file: addresses with at least one tx will be appended here")
-	flag.IntVar(&cfg.Workers, "workers", 10,
+	flag.IntVar(&cfg.Workers, "workers", 20,
 		"number of concurrent workers")
-	flag.IntVar(&cfg.RPS, "rps", 5,
-		"global API requests per second (free Etherscan tier = 5)")
+	flag.IntVar(&cfg.RPS, "rps", 20,
+		"global RPC requests per second cap")
 	flag.IntVar(&cfg.MaxRetries, "retries", 5,
 		"max retries per request on transient errors")
-	flag.DurationVar(&cfg.Timeout, "timeout", 20*time.Second,
+	flag.DurationVar(&cfg.Timeout, "timeout", 15*time.Second,
 		"per-request HTTP timeout")
 	flag.Parse()
 
-	if cfg.APIKey == "" {
-		log.Fatal("api key is required: pass --key or set ETHERSCAN_API_KEY")
-	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 1
 	}
@@ -97,7 +99,6 @@ func NewRateLimiter(rps int) *RateLimiter {
 		tokens: make(chan struct{}, rps),
 		stop:   make(chan struct{}),
 	}
-	// prefill the bucket
 	for i := 0; i < rps; i++ {
 		rl.tokens <- struct{}{}
 	}
@@ -112,7 +113,7 @@ func NewRateLimiter(rps int) *RateLimiter {
 			case <-t.C:
 				select {
 				case rl.tokens <- struct{}{}:
-				default: // bucket full, drop
+				default:
 				}
 			}
 		}
@@ -132,16 +133,33 @@ func (rl *RateLimiter) Wait(ctx context.Context) error {
 func (rl *RateLimiter) Close() { close(rl.stop) }
 
 // ----------------------------------------------------------------------------
-// Etherscan client
+// JSON-RPC client
 // ----------------------------------------------------------------------------
 
-type etherscanResp struct {
-	Status  string          `json:"status"`
-	Message string          `json:"message"`
-	Result  json.RawMessage `json:"result"`
+type rpcRequest struct {
+	JSONRPC string        `json:"jsonrpc"`
+	ID      int           `json:"id"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
 }
 
-// transient signals that a request should be retried.
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *rpcError) Error() string {
+	return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
+}
+
+type rpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+// transientError signals that a request should be retried.
 type transientError struct{ err error }
 
 func (e *transientError) Error() string { return e.err.Error() }
@@ -168,131 +186,167 @@ func NewClient(cfg *Config, rl *RateLimiter) *Client {
 	}
 }
 
-// callOnce performs a single API call. Returns parsed response or an error.
-// Errors wrapped in *transientError should be retried by the caller.
-func (c *Client) callOnce(ctx context.Context, addr, action string) (*etherscanResp, error) {
-	q := url.Values{}
-	q.Set("chainid", fmt.Sprintf("%d", c.cfg.ChainID))
-	q.Set("module", "account")
-	q.Set("action", action)
-	q.Set("address", addr)
-	q.Set("startblock", "0")
-	q.Set("endblock", "99999999")
-	q.Set("page", "1")
-	q.Set("offset", "1") // we only need to know if >=1 tx exists
-	q.Set("sort", "asc")
-	q.Set("apikey", c.cfg.APIKey)
-
-	full := c.cfg.BaseURL + "?" + q.Encode()
-
+// callOnce performs one JSON-RPC call and decodes the result into out (if non-nil).
+// Retryable failures are returned wrapped in *transientError.
+func (c *Client) callOnce(ctx context.Context, method string, params []interface{}, out interface{}) error {
 	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
+		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
+	body, err := json.Marshal(rpcRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  method,
+		Params:  params,
+	})
 	if err != nil {
-		return nil, err // non-retryable
+		return err // non-retryable
 	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.RPCURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, &transientError{err: fmt.Errorf("http: %w", err)}
+		return &transientError{err: fmt.Errorf("http: %w", err)}
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, &transientError{err: fmt.Errorf("read body: %w", err)}
+		return &transientError{err: fmt.Errorf("read body: %w", err)}
 	}
 
-	// 5xx and 429 are classic retryables.
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, &transientError{
-			err: fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(body), 200)),
+		return &transientError{
+			err: fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(raw), 200)),
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
 
-	var r etherscanResp
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("decode json: %w (body=%s)", err, truncate(string(body), 200))
+	var r rpcResponse
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return fmt.Errorf("decode json: %w (body=%s)", err, truncate(string(raw), 200))
 	}
-
-	// Etherscan rate-limit messages come as HTTP 200 with status="0".
-	msg := strings.ToLower(r.Message)
-	if r.Status == "0" && (strings.Contains(msg, "rate limit") ||
-		strings.Contains(msg, "max rate") ||
-		strings.Contains(msg, "max calls")) {
-		return nil, &transientError{err: fmt.Errorf("api rate limit: %s", r.Message)}
+	if r.Error != nil {
+		// -32005 and friends are "limit exceeded" -> retryable.
+		if r.Error.Code == -32005 ||
+			strings.Contains(strings.ToLower(r.Error.Message), "rate") ||
+			strings.Contains(strings.ToLower(r.Error.Message), "limit") ||
+			strings.Contains(strings.ToLower(r.Error.Message), "busy") {
+			return &transientError{err: r.Error}
+		}
+		return r.Error
 	}
-	return &r, nil
+	if out != nil {
+		if err := json.Unmarshal(r.Result, out); err != nil {
+			return fmt.Errorf("decode result: %w", err)
+		}
+	}
+	return nil
 }
 
-// call wraps callOnce with retries and exponential backoff + jitter.
-func (c *Client) call(ctx context.Context, addr, action string) (*etherscanResp, error) {
+// call wraps callOnce with retries + exponential backoff + jitter.
+func (c *Client) call(ctx context.Context, method string, params []interface{}, out interface{}) error {
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
-		r, err := c.callOnce(ctx, addr, action)
+		err := c.callOnce(ctx, method, params, out)
 		if err == nil {
-			return r, nil
+			return nil
 		}
 		lastErr = err
 
 		var te *transientError
 		if !errors.As(err, &te) {
-			return nil, err
+			return err
 		}
 		if attempt == c.cfg.MaxRetries {
 			break
 		}
-		// exp backoff: 300ms, 600ms, 1.2s, 2.4s, ... + up to 250ms jitter
+		// 300ms, 600ms, 1.2s, 2.4s, ... + up to 250ms jitter
 		base := 300 * time.Millisecond << attempt
 		sleep := base + time.Duration(rand.Int63n(int64(250*time.Millisecond)))
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-time.After(sleep):
 		}
 	}
-	return nil, fmt.Errorf("after %d retries: %w", c.cfg.MaxRetries, lastErr)
+	return fmt.Errorf("after %d retries: %w", c.cfg.MaxRetries, lastErr)
 }
 
-// hasActivity returns true if the address has at least one tx of the given kind.
-// Etherscan returns status="1" + non-empty array when there are results,
-// and status="0" with message "No transactions found" otherwise.
-func (c *Client) hasActivity(ctx context.Context, addr, action string) (bool, error) {
-	r, err := c.call(ctx, addr, action)
-	if err != nil {
-		return false, err
+// TxCount returns eth_getTransactionCount(addr, "latest") as uint64.
+func (c *Client) TxCount(ctx context.Context, addr string) (uint64, error) {
+	var hex string
+	if err := c.call(ctx, "eth_getTransactionCount",
+		[]interface{}{addr, "latest"}, &hex); err != nil {
+		return 0, err
 	}
-	if r.Status == "1" {
-		// Result is an array; empty array would be status "0", but be defensive.
-		s := strings.TrimSpace(string(r.Result))
-		return s != "" && s != "[]" && s != "null", nil
-	}
-	// status "0" with "No transactions found" is a legitimate negative answer.
-	if strings.Contains(strings.ToLower(r.Message), "no transactions") {
-		return false, nil
-	}
-	// Any other non-ok message is an error we should surface.
-	return false, fmt.Errorf("api error (action=%s): status=%s msg=%s",
-		action, r.Status, r.Message)
+	return parseHexUint64(hex)
 }
 
-// IsActive checks native / ERC-20 / ERC-721 activity with short-circuit.
+// Balance returns eth_getBalance(addr, "latest") as *big.Int.
+func (c *Client) Balance(ctx context.Context, addr string) (*big.Int, error) {
+	var hex string
+	if err := c.call(ctx, "eth_getBalance",
+		[]interface{}{addr, "latest"}, &hex); err != nil {
+		return nil, err
+	}
+	return parseHexBig(hex)
+}
+
+// IsActive returns true if the address sent at least one tx OR has a non-zero balance.
+// Short-circuits on the first positive signal.
 func (c *Client) IsActive(ctx context.Context, addr string) (bool, error) {
-	for _, action := range []string{"txlist", "tokentx", "tokennfttx"} {
-		active, err := c.hasActivity(ctx, addr, action)
-		if err != nil {
-			return false, fmt.Errorf("%s: %w", action, err)
-		}
-		if active {
-			return true, nil
-		}
+	nonce, err := c.TxCount(ctx, addr)
+	if err != nil {
+		return false, fmt.Errorf("eth_getTransactionCount: %w", err)
 	}
-	return false, nil
+	if nonce > 0 {
+		return true, nil
+	}
+	bal, err := c.Balance(ctx, addr)
+	if err != nil {
+		return false, fmt.Errorf("eth_getBalance: %w", err)
+	}
+	return bal.Sign() > 0, nil
+}
+
+// ----------------------------------------------------------------------------
+// Hex helpers
+// ----------------------------------------------------------------------------
+
+func parseHexUint64(s string) (uint64, error) {
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	if s == "" {
+		return 0, nil
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(s, 16); !ok {
+		return 0, fmt.Errorf("bad hex uint: %q", s)
+	}
+	if !n.IsUint64() {
+		return 0, fmt.Errorf("hex uint overflow: %q", s)
+	}
+	return n.Uint64(), nil
+}
+
+func parseHexBig(s string) (*big.Int, error) {
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	if s == "" {
+		return big.NewInt(0), nil
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(s, 16); !ok {
+		return nil, fmt.Errorf("bad hex big: %q", s)
+	}
+	return n, nil
 }
 
 // ----------------------------------------------------------------------------
@@ -306,7 +360,6 @@ type result struct {
 	err    error
 }
 
-// safeWriter serializes writes to result.txt.
 type safeWriter struct {
 	mu sync.Mutex
 	f  *os.File
@@ -327,7 +380,7 @@ func (w *safeWriter) Write(addr string) error {
 	if _, err := w.bw.WriteString(addr + "\n"); err != nil {
 		return err
 	}
-	return w.bw.Flush() // flush immediately so nothing is lost on crash
+	return w.bw.Flush()
 }
 
 func (w *safeWriter) Close() error {
@@ -356,7 +409,6 @@ func readAddresses(path string) ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Basic EVM address validation.
 		if !isEVMAddress(line) {
 			log.Printf("[warn] skip invalid address: %q", line)
 			continue
@@ -415,6 +467,8 @@ func main() {
 		log.Fatalf("no valid addresses in %s", cfg.InputFile)
 	}
 	log.Printf("loaded %d unique addresses from %s", len(addrs), cfg.InputFile)
+	log.Printf("rpc=%s workers=%d rps=%d retries=%d",
+		cfg.RPCURL, cfg.Workers, cfg.RPS, cfg.MaxRetries)
 
 	writer, err := newSafeWriter(cfg.OutputFile)
 	if err != nil {
@@ -422,7 +476,6 @@ func main() {
 	}
 	defer writer.Close()
 
-	// Cancel on Ctrl+C so in-flight requests unwind gracefully.
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -435,11 +488,10 @@ func main() {
 	jobs := make(chan job, cfg.Workers*2)
 	results := make(chan result, cfg.Workers*2)
 
-	// Workers.
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for j := range jobs {
 				if ctx.Err() != nil {
@@ -448,10 +500,9 @@ func main() {
 				active, err := client.IsActive(ctx, j.addr)
 				results <- result{addr: j.addr, active: active, err: err}
 			}
-		}(i)
+		}()
 	}
 
-	// Feeder.
 	go func() {
 		defer close(jobs)
 		for _, a := range addrs {
@@ -463,13 +514,11 @@ func main() {
 		}
 	}()
 
-	// Closer for results.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collector + progress.
 	var (
 		total     = len(addrs)
 		done      int64
