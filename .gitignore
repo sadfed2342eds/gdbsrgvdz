@@ -1,0 +1,12 @@
+# Build artifacts
+/gdbsrgvdz
+/checker
+*.exe
+
+# Runtime data
+result.txt
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
