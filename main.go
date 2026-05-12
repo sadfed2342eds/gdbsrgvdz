@@ -4,20 +4,23 @@
 // activity via a public GoChain JSON-RPC node and appends active addresses
 // to --out (default: result.txt).
 //
-// "Activity" for a public JSON-RPC node (no indexer) is defined as:
-//   - eth_getTransactionCount(addr, "latest") > 0  -> the address has sent
-//     at least one tx (native transfer, token transfer, contract call, ...),
-//     OR
-//   - eth_getBalance(addr, "latest") > 0           -> the address has received
-//     native funds at least once.
+// Activity checks, in order (short-circuit on first positive signal):
+//  1. eth_getTransactionCount(addr, "latest") > 0
+//     -> address has SENT at least one tx (native, token, contract call, ...).
+//  2. eth_getBalance(addr, "latest") > 0
+//     -> address has a non-zero native balance (received native funds).
+//  3. eth_getLogs for Transfer events where `to` == addr (optional, --logs).
+//     Covers ERC-20, ERC-721 and ERC-1155 incoming transfers, so even a
+//     "receive-only" wallet that has since been drained is detected.
 //
-// If either holds, the address is considered active and written to result.txt.
-// Short-circuit: we stop checking an address as soon as activity is found.
+// If --logs=true and the node rejects a wide block range, we fall back to
+// chunked scanning of [0, latest] in --chunk sized windows.
 //
 // Features:
 //   - Worker pool with configurable concurrency.
 //   - Global rate limiter (token bucket) to respect node quota.
 //   - Retries with exponential backoff + jitter on transient errors.
+//   - Short-circuit at every level.
 //   - Streaming writer with mutex, so result.txt is always consistent.
 //   - Graceful shutdown on Ctrl+C.
 package main
@@ -37,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +60,8 @@ type Config struct {
 	RPS        int
 	MaxRetries int
 	Timeout    time.Duration
+	CheckLogs  bool
+	ChunkSize  uint64
 }
 
 func parseFlags() *Config {
@@ -72,8 +78,12 @@ func parseFlags() *Config {
 		"global RPC requests per second cap")
 	flag.IntVar(&cfg.MaxRetries, "retries", 5,
 		"max retries per request on transient errors")
-	flag.DurationVar(&cfg.Timeout, "timeout", 15*time.Second,
+	flag.DurationVar(&cfg.Timeout, "timeout", 30*time.Second,
 		"per-request HTTP timeout")
+	flag.BoolVar(&cfg.CheckLogs, "logs", true,
+		"also scan eth_getLogs for incoming ERC-20/721/1155 transfers (catches receive-only wallets)")
+	flag.Uint64Var(&cfg.ChunkSize, "chunk", 0,
+		"block range per eth_getLogs call (0 = try full range first, chunk only on error)")
 	flag.Parse()
 
 	if cfg.Workers <= 0 {
@@ -159,16 +169,26 @@ type rpcResponse struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
-// transientError signals that a request should be retried.
 type transientError struct{ err error }
 
 func (e *transientError) Error() string { return e.err.Error() }
 func (e *transientError) Unwrap() error { return e.err }
 
+// rangeTooWideError means the node rejected a logs query because the block
+// range / response is too large. We DO NOT retry; we chunk instead.
+type rangeTooWideError struct{ err error }
+
+func (e *rangeTooWideError) Error() string { return e.err.Error() }
+func (e *rangeTooWideError) Unwrap() error { return e.err }
+
 type Client struct {
 	http    *http.Client
 	cfg     *Config
 	limiter *RateLimiter
+
+	latestOnce sync.Once
+	latest     uint64
+	latestErr  error
 }
 
 func NewClient(cfg *Config, rl *RateLimiter) *Client {
@@ -186,8 +206,7 @@ func NewClient(cfg *Config, rl *RateLimiter) *Client {
 	}
 }
 
-// callOnce performs one JSON-RPC call and decodes the result into out (if non-nil).
-// Retryable failures are returned wrapped in *transientError.
+// callOnce performs one JSON-RPC call and decodes the result into out.
 func (c *Client) callOnce(ctx context.Context, method string, params []interface{}, out interface{}) error {
 	if err := c.limiter.Wait(ctx); err != nil {
 		return err
@@ -200,7 +219,7 @@ func (c *Client) callOnce(ctx context.Context, method string, params []interface
 		Params:  params,
 	})
 	if err != nil {
-		return err // non-retryable
+		return err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.RPCURL, bytes.NewReader(body))
@@ -216,7 +235,7 @@ func (c *Client) callOnce(ctx context.Context, method string, params []interface
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return &transientError{err: fmt.Errorf("read body: %w", err)}
 	}
@@ -235,14 +254,27 @@ func (c *Client) callOnce(ctx context.Context, method string, params []interface
 		return fmt.Errorf("decode json: %w (body=%s)", err, truncate(string(raw), 200))
 	}
 	if r.Error != nil {
-		// -32005 and friends are "limit exceeded" -> retryable.
-		if r.Error.Code == -32005 ||
-			strings.Contains(strings.ToLower(r.Error.Message), "rate") ||
-			strings.Contains(strings.ToLower(r.Error.Message), "limit") ||
-			strings.Contains(strings.ToLower(r.Error.Message), "busy") {
+		msg := strings.ToLower(r.Error.Message)
+		switch {
+		// "range too wide", "too many results", "query returned more than ..."
+		// -- we should chunk, not retry.
+		case strings.Contains(msg, "range") ||
+			strings.Contains(msg, "too many") ||
+			strings.Contains(msg, "exceed") ||
+			strings.Contains(msg, "maximum") ||
+			strings.Contains(msg, "response size") ||
+			strings.Contains(msg, "returned more than"):
+			return &rangeTooWideError{err: r.Error}
+		// generic "retryable" signals
+		case r.Error.Code == -32005 ||
+			strings.Contains(msg, "rate") ||
+			strings.Contains(msg, "limit") ||
+			strings.Contains(msg, "busy") ||
+			strings.Contains(msg, "timeout"):
 			return &transientError{err: r.Error}
+		default:
+			return r.Error
 		}
-		return r.Error
 	}
 	if out != nil {
 		if err := json.Unmarshal(r.Result, out); err != nil {
@@ -253,6 +285,7 @@ func (c *Client) callOnce(ctx context.Context, method string, params []interface
 }
 
 // call wraps callOnce with retries + exponential backoff + jitter.
+// rangeTooWideError is NOT retried -- it is returned to the caller so it can chunk.
 func (c *Client) call(ctx context.Context, method string, params []interface{}, out interface{}) error {
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
@@ -262,6 +295,10 @@ func (c *Client) call(ctx context.Context, method string, params []interface{}, 
 		}
 		lastErr = err
 
+		var rte *rangeTooWideError
+		if errors.As(err, &rte) {
+			return err
+		}
 		var te *transientError
 		if !errors.As(err, &te) {
 			return err
@@ -269,7 +306,6 @@ func (c *Client) call(ctx context.Context, method string, params []interface{}, 
 		if attempt == c.cfg.MaxRetries {
 			break
 		}
-		// 300ms, 600ms, 1.2s, 2.4s, ... + up to 250ms jitter
 		base := 300 * time.Millisecond << attempt
 		sleep := base + time.Duration(rand.Int63n(int64(250*time.Millisecond)))
 		select {
@@ -281,7 +317,10 @@ func (c *Client) call(ctx context.Context, method string, params []interface{}, 
 	return fmt.Errorf("after %d retries: %w", c.cfg.MaxRetries, lastErr)
 }
 
-// TxCount returns eth_getTransactionCount(addr, "latest") as uint64.
+// ----------------------------------------------------------------------------
+// RPC helpers
+// ----------------------------------------------------------------------------
+
 func (c *Client) TxCount(ctx context.Context, addr string) (uint64, error) {
 	var hex string
 	if err := c.call(ctx, "eth_getTransactionCount",
@@ -291,7 +330,6 @@ func (c *Client) TxCount(ctx context.Context, addr string) (uint64, error) {
 	return parseHexUint64(hex)
 }
 
-// Balance returns eth_getBalance(addr, "latest") as *big.Int.
 func (c *Client) Balance(ctx context.Context, addr string) (*big.Int, error) {
 	var hex string
 	if err := c.call(ctx, "eth_getBalance",
@@ -301,8 +339,160 @@ func (c *Client) Balance(ctx context.Context, addr string) (*big.Int, error) {
 	return parseHexBig(hex)
 }
 
-// IsActive returns true if the address sent at least one tx OR has a non-zero balance.
-// Short-circuits on the first positive signal.
+func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
+	var hex string
+	if err := c.call(ctx, "eth_blockNumber", []interface{}{}, &hex); err != nil {
+		return 0, err
+	}
+	return parseHexUint64(hex)
+}
+
+// LatestBlock caches eth_blockNumber across the whole run so we don't hit the
+// node for every address.
+func (c *Client) LatestBlock(ctx context.Context) (uint64, error) {
+	c.latestOnce.Do(func() {
+		c.latest, c.latestErr = c.BlockNumber(ctx)
+	})
+	return c.latest, c.latestErr
+}
+
+// ----------------------------------------------------------------------------
+// Logs-based activity check
+// ----------------------------------------------------------------------------
+
+const (
+	// keccak256("Transfer(address,address,uint256)")
+	// Same topic0 for ERC-20 and ERC-721; `to` is topic index 2.
+	topicERC20721Transfer = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	// keccak256("TransferSingle(address,address,address,uint256,uint256)")
+	// ERC-1155; `to` is topic index 3.
+	topicERC1155Single = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+	// keccak256("TransferBatch(address,address,address,uint256[],uint256[])")
+	// ERC-1155; `to` is topic index 3.
+	topicERC1155Batch = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
+)
+
+// padAddress left-pads a 20-byte address to a 32-byte hex topic value.
+func padAddress(addr string) string {
+	clean := strings.ToLower(strings.TrimPrefix(addr, "0x"))
+	return "0x" + strings.Repeat("0", 64-len(clean)) + clean
+}
+
+// buildTopics returns a topics filter where `to` is constrained to addr at
+// the given position, and all preceding positions are unconstrained (null).
+// topic0 can be a single hash or an OR-array of hashes.
+func buildTopics(topic0 interface{}, toPos int, addr string) []interface{} {
+	t := make([]interface{}, toPos+1)
+	t[0] = topic0
+	for i := 1; i < toPos; i++ {
+		t[i] = nil
+	}
+	t[toPos] = padAddress(addr)
+	return t
+}
+
+// getLogsRange calls eth_getLogs for [fromBlock, toBlock] and returns true if
+// at least one log matched.
+func (c *Client) getLogsRange(ctx context.Context, topics []interface{}, fromBlock, toBlock string) (bool, error) {
+	filter := map[string]interface{}{
+		"fromBlock": fromBlock,
+		"toBlock":   toBlock,
+		"topics":    topics,
+	}
+	var logs []json.RawMessage
+	if err := c.call(ctx, "eth_getLogs", []interface{}{filter}, &logs); err != nil {
+		return false, err
+	}
+	return len(logs) > 0, nil
+}
+
+// hasIncomingByTopics scans [0, latest] for Transfer-like events targeting addr.
+// If --chunk==0 we first try the full range and only chunk on a range-too-wide
+// error; otherwise we go straight to fixed-size chunks.
+func (c *Client) hasIncomingByTopics(ctx context.Context, topics []interface{}) (bool, error) {
+	latest, err := c.LatestBlock(ctx)
+	if err != nil {
+		return false, fmt.Errorf("eth_blockNumber: %w", err)
+	}
+
+	chunk := c.cfg.ChunkSize
+	if chunk == 0 {
+		has, err := c.getLogsRange(ctx, topics, "0x0", "latest")
+		if err == nil {
+			return has, nil
+		}
+		var rte *rangeTooWideError
+		if !errors.As(err, &rte) {
+			return false, err
+		}
+		// Fall back to a safe default chunk.
+		chunk = 200_000
+	}
+
+	for start := uint64(0); start <= latest; start += chunk {
+		end := start + chunk - 1
+		if end > latest {
+			end = latest
+		}
+		has, err := c.getLogsRange(ctx, topics,
+			"0x"+strconv.FormatUint(start, 16),
+			"0x"+strconv.FormatUint(end, 16))
+		if err != nil {
+			// If THIS chunk is still too wide, halve it on the fly.
+			var rte *rangeTooWideError
+			if errors.As(err, &rte) && chunk > 1 {
+				chunk /= 2
+				// Re-run this same window with the smaller chunk.
+				for s := start; s <= end; s += chunk {
+					e := s + chunk - 1
+					if e > end {
+						e = end
+					}
+					h, err := c.getLogsRange(ctx, topics,
+						"0x"+strconv.FormatUint(s, 16),
+						"0x"+strconv.FormatUint(e, 16))
+					if err != nil {
+						return false, err
+					}
+					if h {
+						return true, nil
+					}
+				}
+				continue
+			}
+			return false, err
+		}
+		if has {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// hasIncomingTransfers checks ERC-20/721 then ERC-1155 with short-circuit.
+func (c *Client) hasIncomingTransfers(ctx context.Context, addr string) (bool, error) {
+	// ERC-20 / ERC-721: single topic0, `to` at position 2.
+	t1 := buildTopics(topicERC20721Transfer, 2, addr)
+	has, err := c.hasIncomingByTopics(ctx, t1)
+	if err != nil {
+		return false, fmt.Errorf("logs erc20/721: %w", err)
+	}
+	if has {
+		return true, nil
+	}
+	// ERC-1155: OR of two topic0s, `to` at position 3.
+	t2 := buildTopics([]string{topicERC1155Single, topicERC1155Batch}, 3, addr)
+	has, err = c.hasIncomingByTopics(ctx, t2)
+	if err != nil {
+		return false, fmt.Errorf("logs erc1155: %w", err)
+	}
+	return has, nil
+}
+
+// ----------------------------------------------------------------------------
+// IsActive
+// ----------------------------------------------------------------------------
+
 func (c *Client) IsActive(ctx context.Context, addr string) (bool, error) {
 	nonce, err := c.TxCount(ctx, addr)
 	if err != nil {
@@ -315,7 +505,13 @@ func (c *Client) IsActive(ctx context.Context, addr string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("eth_getBalance: %w", err)
 	}
-	return bal.Sign() > 0, nil
+	if bal.Sign() > 0 {
+		return true, nil
+	}
+	if !c.cfg.CheckLogs {
+		return false, nil
+	}
+	return c.hasIncomingTransfers(ctx, addr)
 }
 
 // ----------------------------------------------------------------------------
@@ -467,8 +663,8 @@ func main() {
 		log.Fatalf("no valid addresses in %s", cfg.InputFile)
 	}
 	log.Printf("loaded %d unique addresses from %s", len(addrs), cfg.InputFile)
-	log.Printf("rpc=%s workers=%d rps=%d retries=%d",
-		cfg.RPCURL, cfg.Workers, cfg.RPS, cfg.MaxRetries)
+	log.Printf("rpc=%s workers=%d rps=%d retries=%d logs=%t chunk=%d",
+		cfg.RPCURL, cfg.Workers, cfg.RPS, cfg.MaxRetries, cfg.CheckLogs, cfg.ChunkSize)
 
 	writer, err := newSafeWriter(cfg.OutputFile)
 	if err != nil {
@@ -484,6 +680,15 @@ func main() {
 	defer limiter.Close()
 
 	client := NewClient(cfg, limiter)
+
+	// Warm up latest block once; makes the first logs query predictable.
+	if cfg.CheckLogs {
+		if n, err := client.LatestBlock(ctx); err != nil {
+			log.Fatalf("eth_blockNumber: %v", err)
+		} else {
+			log.Printf("latest block = %d", n)
+		}
+	}
 
 	jobs := make(chan job, cfg.Workers*2)
 	results := make(chan result, cfg.Workers*2)
